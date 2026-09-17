@@ -7,7 +7,9 @@
     "start": "node server.cjs"
   },
   "dependencies": {
-    "express": "^4.21.2"
+    "@whiskeysockets/baileys": "^7.0.0-rc14",
+    "express": "^4.21.2",
+    "qrcode": "^1.5.4"
   },
   "engines": {
     "node": ">=18"

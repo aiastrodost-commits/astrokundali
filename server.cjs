@@ -1,19 +1,22 @@
 /**
  * AstroDost AI Proxy Server — Railway Deployment
  * -----------------------------------------------
- * Aapke original server.ts ka lightweight version:
  * - /api/gemini/* endpoints (app ke custom-server client ke liye)
  * - Gemini direct + OpenRouter fallback chain (SERVER-side, keys safe)
- * - Static frontend bhi serve karta hai (public/ available ho to)
+ * - WhatsApp AI bot (Baileys) — pairing: /wa page (WA_BOT=off se disable)
  *
  * Railway env vars (Dashboard > Variables):
  *   GEMINI_API_KEY       (optional)
  *   OPENROUTER_API_KEY   (recommended)
+ *   SETUP_PIN            (WhatsApp pairing page ka PIN, default 4321)
+ *   WA_BOT=off           (WhatsApp bot band karne ke liye)
  *   PORT                 (Railway khud set karta hai)
  */
 
 const express = require('express');
 const path = require('path');
+const WA_ENABLED = process.env.WA_BOT !== 'off';
+const { startWhatsApp, waStatus, requestCode, logoutWa } = WA_ENABLED ? require('./whatsapp.cjs') : {};
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -125,33 +128,8 @@ async function callOpenRouter(model, systemPrompt, userPrompt, history, temperat
   }
 }
 
-/** Universal fallback chain — kisi bhi /api/gemini/* endpoint ke liye */
-async function smartAIChain(systemPrompt, userPrompt, history, temperature) {
-  const attempts = [];
-  const geminiKey = process.env.GEMINI_API_KEY;
-  const orKey = process.env.OPENROUTER_API_KEY;
-
-  if (geminiKey) {
-    for (const model of GEMINI_MODELS) {
-      attempts.push(() => callGemini(model, systemPrompt, userPrompt, history, temperature, geminiKey));
-    }
-  }
-  if (orKey) {
-    for (const model of OPENROUTER_CURATED) {
-      attempts.push(() => callOpenRouter(model, systemPrompt, userPrompt, history, temperature, orKey));
-    }
-  }
-
-  for (const attempt of attempts) {
-    try {
-      const text = await withTimeout(attempt(), 26000);
-      return text;
-    } catch (err) {
-      console.warn('[chain] provider failed:', err.message);
-    }
-  }
-  return null;
-}
+/** Universal fallback chain — ab ai-chain.cjs module se (WhatsApp bot bhi use karta hai) */
+const { smartAIChain } = require('./ai-chain.cjs');
 
 // ---------------------------------------------------------------------------
 // Endpoints (app ka custom-server client ye shapes expect karta hai)
@@ -186,17 +164,100 @@ app.post('/api/gemini/kundali-analysis', handler('analysis'));
 app.post('/api/gemini/matchmaking', handler('report'));
 app.post('/api/gemini/prashna', handler('answer'));
 
+// ---------------------------------------------------------------------------
+// WhatsApp bot pairing page + API
+// ---------------------------------------------------------------------------
+
+app.get('/wa/status', (req, res) => {
+  if (!WA_ENABLED) return res.json({ status: 'disabled', connected: false });
+  const s = waStatus();
+  res.json({ ...s, qr: undefined, hasQR: Boolean(s.qr) });
+});
+
+app.get('/wa/qr', (req, res) => {
+  if (!WA_ENABLED) return res.status(404).send('WhatsApp bot disabled');
+  const s = waStatus();
+  if (!s.qr) return res.status(404).json({ error: 'no QR abhi' });
+  res.json({ qr: s.qr });
+});
+
+app.post('/wa/request-code', async (req, res) => {
+  if (!WA_ENABLED) return res.status(404).json({ error: 'WhatsApp bot disabled' });
+  const { phone, pin } = req.body || {};
+  const r = await requestCode(phone, pin);
+  res.json(r);
+});
+
+app.post('/wa/logout', async (req, res) => {
+  if (!WA_ENABLED) return res.status(404).json({ error: 'WhatsApp bot disabled' });
+  res.json(await logoutWa());
+});
+
+// Pairing web page (mobile-friendly)
+app.get('/wa', (req, res) => {
+  res.send(`<!DOCTYPE html>
+<html lang="hi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AstroDost WhatsApp Setup</title>
+<style>
+ body{font-family:system-ui;background:#0f0e17;color:#fffffe;max-width:480px;margin:0 auto;padding:24px}
+ h1{font-size:1.4rem} .card{background:#1a1926;border-radius:12px;padding:20px;margin:12px 0}
+ input{width:100%;box-sizing:border-box;padding:12px;border-radius:8px;border:1px solid #444;background:#242335;color:#fff;font-size:1rem;margin:6px 0}
+ button{width:100%;padding:12px;border:0;border-radius:8px;background:#7f5af0;color:#fff;font-size:1rem;font-weight:600;cursor:pointer;margin-top:8px}
+ .ok{color:#2cb67d}.bad{color:#ff5470}.muted{color:#8b8ca7;font-size:.85rem}
+ img{width:100%;max-width:280px;border-radius:8px;background:#fff;padding:8px}
+ #code{font-size:2rem;letter-spacing:.3rem;text-align:center;color:#2cb67d;font-weight:700;margin:10px 0}
+</style></head><body>
+<h1>🪐 AstroDost WhatsApp Bot</h1>
+<div class="card">
+ <div>Status: <b id="st">checking…</b></div>
+ <div id="pairbox" style="display:none">
+   <div id="code"></div>
+   <div class="muted">WhatsApp → Settings → Linked devices → Link a device → “Link with phone number instead” → ye code daalo</div>
+ </div>
+ <div id="qrbox" style="display:none"><img id="qr" alt="QR"><div class="muted">Ya QR scan karo: WhatsApp → Linked devices → Link a device</div></div>
+</div>
+<div class="card">
+ <h3>📲 Naya number link karo</h3>
+ <input id="phone" placeholder="WhatsApp number (country code ke saath) — e.g. 919876543210">
+ <input id="pin" placeholder="Setup PIN (Railway SETUP_PIN variable, default 4321)">
+ <button onclick="link()">Pairing Code Lo</button>
+ <div id="msg" class="muted"></div>
+</div>
+<div class="card"><button style="background:#ff5470" onclick="unlink()">Logout / Unlink</button></div>
+<script>
+async function refresh(){
+ const s=await (await fetch('/wa/status')).json();
+ document.getElementById('st').textContent=s.status+(s.pairingCode?(' — code: '+s.pairingCode):'');
+ document.getElementById('st').className=s.connected?'ok':(s.status==='qr'||s.status==='pairing'?'':'bad');
+ if(s.pairingCode){document.getElementById('pairbox').style.display='block';document.getElementById('code').textContent=s.pairingCode;}
+ if(s.hasQR){try{const q=await(await fetch('/wa/qr')).json();document.getElementById('qrbox').style.display='block';document.getElementById('qr').src=q.qr;}catch(e){}}
+}
+async function link(){
+ const p=document.getElementById('phone').value.trim(),pin=document.getElementById('pin').value.trim();
+ const r=await(await fetch('/wa/request-code',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:p,pin})})).json();
+ document.getElementById('msg').textContent=r.ok?('✅ Code mila: '+r.code+' — 60 second mein WhatsApp mein daalo'):('❌ '+(r.error||'fail'));
+ document.getElementById('msg').className=r.ok?'ok':'bad'; setTimeout(refresh,1500);
+}
+async function unlink(){ if(confirm('Bot unlink karein?')){await fetch('/wa/logout',{method:'POST'});setTimeout(refresh,1500);} }
+refresh(); setInterval(refresh,5000);
+</script></body></html>`);
+});
+
 // Static frontend (agar public/ folder Railway pe upload hua hai)
 const publicDir = path.join(__dirname, 'public');
 app.use(express.static(publicDir));
 app.get('*', (req, res) => {
-  if (req.path.startsWith('/api/')) return res.status(404).json({ error: 'not found' });
+  if (req.path.startsWith('/api/') || req.path.startsWith('/wa')) return res.status(404).json({ error: 'not found' });
   res.sendFile(path.join(publicDir, 'index.html'), (err) => {
-    if (err) res.status(200).send('AstroDost AI Proxy Server running. API: /api/gemini/chat');
+    if (err) res.status(200).send('AstroDost AI Proxy Server running. API: /api/gemini/chat | WhatsApp setup: /wa');
   });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`✨ AstroDost Proxy on :${PORT}`);
   console.log(`   Gemini: ${process.env.GEMINI_API_KEY ? 'YES' : 'no'} | OpenRouter: ${process.env.OPENROUTER_API_KEY ? 'YES' : 'no'}`);
+  console.log(`   WhatsApp bot: ${WA_ENABLED ? 'ON (setup: /wa)' : 'off'}`);
+  if (WA_ENABLED) {
+    startWhatsApp().catch((e) => console.error('[WA] start failed:', e.message));
+  }
 });
